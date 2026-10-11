@@ -11,6 +11,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use thiserror::Error;
 
 /// 内嵌 relay 的绑定方式。
+#[derive(Debug)]
 pub enum RelayBind {
     /// 生产:HTTPS + 可选 QUIC 地址发现,证书由调用方提供。
     Tls {
