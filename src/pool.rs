@@ -118,6 +118,10 @@ impl RelayPool {
     /// 处理一条公告 wire:验签 → 信任 → 回放 → 容量 → 挂载。
     ///
     /// 返回 `Ok(Some(ann))` 表示新入池;`Ok(None)` 表示 gossip 重复投递(仅刷新 last_seen)。
+    ///
+    /// 并发安全:决策(trust/ttl/seq)与记账(容量复查+淘汰+插入)各自在单次锁内
+    /// 原子完成,锁 guard 不跨 await;锁外只做 endpoint 调用与事件发送。
+    /// 容量的权威裁决在记账段——两个并发 handle_wire 不可能同时挤占最后一个槽位。
     pub async fn handle_wire(
         &self,
         bytes: &[u8],
@@ -125,8 +129,8 @@ impl RelayPool {
     ) -> Result<Option<RelayAnnouncement>, PoolError> {
         let ann = RelayAnnouncement::verify_signature(bytes)?;
 
-        // 决策段:只做同步判断,不跨 await 持锁;重复/拒绝路径在此提前返回。
-        let evict = {
+        // 决策段:锁内同步判断;重复/拒绝路径在此提前返回。
+        {
             let mut inner = self.inner.write().expect("pool lock");
             // 入池即检查池自己的 TTL(过期/超前的未来时间戳都拒,防止挂载死 relay)。
             if ann.is_expired_with_ttl(now_unix, inner.config.ttl) {
@@ -154,31 +158,44 @@ impl RelayPool {
             if inner.config.max_entries == 0 {
                 return Err(PoolError::CapacityEvicted);
             }
-            if !inner.entries.contains_key(&ann.relay_url)
+        }
+
+        // 记账段:容量复查 + 淘汰 + 插入,单次写锁内原子完成。
+        let url = ann.relay_url.clone();
+        let evicted: Option<RelayUrl> = {
+            let mut inner = self.inner.write().expect("pool lock");
+            let evicted = if !inner.entries.contains_key(&url)
                 && inner.entries.len() >= inner.config.max_entries
             {
-                Some(
-                    inner
-                        .entries
-                        .iter()
-                        .min_by_key(|(_, e)| e.last_seen)
-                        .map(|(url, _)| url.clone())
-                        .expect("non-empty"),
-                )
+                let victim = inner
+                    .entries
+                    .iter()
+                    .min_by_key(|(_, e)| e.last_seen)
+                    .map(|(victim_url, _)| victim_url.clone())
+                    .expect("non-empty");
+                inner.entries.remove(&victim);
+                Some(victim)
             } else {
                 None
-            }
+            };
+            inner.max_seq.insert(ann.node_id, ann.seq);
+            inner.entries.insert(
+                url.clone(),
+                PoolEntry {
+                    ann: ann.clone(),
+                    wire: Bytes::copy_from_slice(bytes),
+                    first_seen: now_unix,
+                    last_seen: now_unix,
+                },
+            );
+            evicted
         };
 
-
-        // 挂载段:无锁 await。
-        if let Some(evict) = evict {
-            self.inner.write().expect("pool lock").entries.remove(&evict);
-            let endpoint = self.endpoint();
-            endpoint.remove_relay(&evict).await;
-            self.emit(RelayPoolEvent::Removed(evict));
+        // 锁外段:endpoint 调用与事件。
+        if let Some(evicted) = &evicted {
+            self.endpoint().remove_relay(evicted).await;
+            self.emit(RelayPoolEvent::Removed(evicted.clone()));
         }
-        let url = ann.relay_url.clone();
         self.endpoint()
             .insert_relay(
                 url.clone(),
@@ -188,22 +205,7 @@ impl RelayPool {
                 )),
             )
             .await;
-
-        // 记账段。
-        {
-            let mut inner = self.inner.write().expect("pool lock");
-            inner.max_seq.insert(ann.node_id, ann.seq);
-            inner.entries.insert(
-                url,
-                PoolEntry {
-                    ann: ann.clone(),
-                    wire: Bytes::copy_from_slice(bytes),
-                    first_seen: now_unix,
-                    last_seen: now_unix,
-                },
-            );
-            let _ = inner.events.try_send(RelayPoolEvent::Added(ann.clone()));
-        }
+        self.emit(RelayPoolEvent::Added(ann.clone()));
         Ok(Some(ann))
     }
 
@@ -237,33 +239,43 @@ impl RelayPool {
     /// 同时清掉已无存活条目的公告者的 `max_seq` 记录:
     /// 否则重启后 seq 从 1 重新计数的公告者会被旧记录当回放拒掉,
     /// 且 `Trust::Everyone` 下该表可被无界撑大。
+    ///
+    /// 收集与移表在单次写锁内原子完成;锁外卸载前复查条目是否已被
+    /// 并发 handle_wire 换新换回——是则跳过卸载与 Removed 事件。
     pub async fn sweep(&self, now_unix: u64) {
         let expired: Vec<RelayUrl> = {
-            let inner = self.inner.read().expect("pool lock");
+            let mut inner = self.inner.write().expect("pool lock");
             let ttl = inner.config.ttl;
-            inner
+            let expired: Vec<RelayUrl> = inner
                 .entries
                 .iter()
                 .filter(|(_, e)| e.ann.is_expired_with_ttl(now_unix, ttl))
                 .map(|(url, _)| url.clone())
-                .collect()
-        };
-        for url in expired {
-            let endpoint = {
-                let mut inner = self.inner.write().expect("pool lock");
-                if inner.entries.remove(&url).is_none() {
-                    continue;
-                }
-                let _ = inner.events.try_send(RelayPoolEvent::Removed(url.clone()));
-                inner.endpoint.clone()
-            };
-            endpoint.remove_relay(&url).await;
-        }
-        {
-            let mut inner = self.inner.write().expect("pool lock");
+                .collect();
+            for url in &expired {
+                inner.entries.remove(url);
+            }
             let live: HashSet<EndpointId> =
                 inner.entries.values().map(|e| e.ann.node_id).collect();
             inner.max_seq.retain(|id, _| live.contains(id));
+            expired
+        };
+        if expired.is_empty() {
+            return;
+        }
+        let endpoint = self.endpoint();
+        for url in expired {
+            let refreshed = self
+                .inner
+                .read()
+                .expect("pool lock")
+                .entries
+                .contains_key(&url);
+            if refreshed {
+                continue;
+            }
+            endpoint.remove_relay(&url).await;
+            self.emit(RelayPoolEvent::Removed(url));
         }
     }
 
@@ -412,6 +424,78 @@ mod tests {
         assert!(
             matches!(res, Ok(Some(_))),
             "fresh announcement after sweep must be accepted despite lower seq"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_handles_respect_capacity() {
+        // current-thread runtime:两任务仅在 await 点交错,构造确定性竞态。
+        let ep = endpoint().await;
+        let (pool, mut events) = RelayPool::new(
+            ep,
+            RelayPoolConfig { max_entries: 1, ..Default::default() },
+        );
+        let sk_a = SecretKey::generate();
+        let sk_b = SecretKey::generate();
+        let url_a: RelayUrl = "https://127.0.0.1:3341".parse().expect("valid url");
+        let url_b: RelayUrl = "https://127.0.0.1:3342".parse().expect("valid url");
+        let wa = RelayAnnouncement::new(sk_a.public(), url_a, None, 1, NOW).sign(&sk_a);
+        let wb = RelayAnnouncement::new(sk_b.public(), url_b, None, 1, NOW).sign(&sk_b);
+
+        let (ra, rb) = tokio::join!(
+            pool.handle_wire(&wa, NOW),
+            pool.handle_wire(&wb, NOW),
+        );
+        assert!(ra.is_ok() && rb.is_ok(), "both wires are valid: {ra:?} {rb:?}");
+        assert_eq!(
+            pool.known().len(),
+            1,
+            "capacity must hold even under concurrent intake"
+        );
+        let mut removed = 0;
+        let mut added = 0;
+        while let Ok(ev) = events.try_recv() {
+            match ev {
+                RelayPoolEvent::Removed(_) => removed += 1,
+                RelayPoolEvent::Added(_) => added += 1,
+            }
+        }
+        assert_eq!(removed, 1, "exactly one eviction event");
+        assert_eq!(added, 2, "both wires were accepted");
+    }
+
+    #[tokio::test]
+    async fn sweep_keeps_refreshed_entry() {
+        let ep = endpoint().await;
+        let (pool, _events) = RelayPool::new(
+            ep,
+            RelayPoolConfig { ttl: Duration::from_secs(60), ..Default::default() },
+        );
+        let sk1 = SecretKey::generate();
+        let sk2 = SecretKey::generate();
+        let url1: RelayUrl = "https://127.0.0.1:3341".parse().expect("valid url");
+        let url2: RelayUrl = "https://127.0.0.1:3342".parse().expect("valid url");
+        pool.handle_wire(&RelayAnnouncement::new(sk1.public(), url1.clone(), None, 1, NOW).sign(&sk1), NOW).await.expect("url1 adds");
+        pool.handle_wire(&RelayAnnouncement::new(sk2.public(), url2.clone(), None, 1, NOW).sign(&sk2), NOW).await.expect("url2 adds");
+
+        // sweep 在第一个 remove_relay().await 处让出;此刻 URL-2 被换新(seq 2,新时间戳)。
+        let sweep = tokio::spawn({
+            let pool = pool.clone();
+            async move { pool.sweep(NOW + 61).await }
+        });
+        tokio::task::yield_now().await;
+        pool.handle_wire(
+            &RelayAnnouncement::new(sk2.public(), url2.clone(), None, 2, NOW + 61).sign(&sk2),
+            NOW + 61,
+        )
+        .await
+        .expect("url2 refresh accepted");
+        sweep.await.expect("sweep task");
+
+        let known = pool.known();
+        assert!(
+            known.iter().any(|a| a.relay_url == url2 && a.seq == 2),
+            "refreshed entry must survive a concurrent sweep, got {known:?}"
         );
     }
 
