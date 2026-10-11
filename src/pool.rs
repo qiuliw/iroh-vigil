@@ -127,6 +127,17 @@ impl RelayPool {
         bytes: &[u8],
         now_unix: u64,
     ) -> Result<Option<RelayAnnouncement>, PoolError> {
+        // 信任过滤先于验签:廉价解析出公告者 id,拒绝不信任者时不消耗 ed25519 验签。
+        // 验签仍是接受的唯一门槛——parse_unverified 的结果不单独作数。
+        let claimed = RelayAnnouncement::parse_unverified(bytes)?;
+        {
+            let inner = self.inner.read().expect("pool lock");
+            match inner.config.trust {
+                Trust::Everyone => {}
+                Trust::Only(ref ids) if ids.contains(&claimed.node_id) => {}
+                Trust::Only(_) => return Err(PoolError::Untrusted),
+            }
+        }
         let ann = RelayAnnouncement::verify_signature(bytes)?;
 
         // 决策段:锁内同步判断;重复/拒绝路径在此提前返回。
@@ -135,11 +146,6 @@ impl RelayPool {
             // 入池即检查池自己的 TTL(过期/超前的未来时间戳都拒,防止挂载死 relay)。
             if ann.is_expired_with_ttl(now_unix, inner.config.ttl) {
                 return Err(PoolError::Announce(AnnounceError::Expired));
-            }
-            match inner.config.trust {
-                Trust::Everyone => {}
-                Trust::Only(ref ids) if ids.contains(&ann.node_id) => {}
-                Trust::Only(_) => return Err(PoolError::Untrusted),
             }
             if let Some(&seq) = inner.max_seq.get(&ann.node_id) {
                 if ann.seq < seq {

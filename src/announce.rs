@@ -72,17 +72,24 @@ impl RelayAnnouncement {
 
     /// 只验签解码,不做 TTL 检查(池用自己的 ttl 复查)。
     pub fn verify_signature(bytes: &[u8]) -> Result<Self, AnnounceError> {
+        let ann = Self::parse_unverified(bytes)?;
+        let signature = Signature::from_bytes(bytes[1..65].try_into().expect("length checked"));
+        ann.node_id
+            .verify(&bytes[65..], &signature)
+            .map_err(|_| AnnounceError::BadSignature)?;
+        Ok(ann)
+    }
+
+    /// 解析 wire 帧但不验签。
+    ///
+    /// 仅供池在昂贵的 ed25519 验签**之前**读取公告者 id 做信任过滤;
+    /// 未经此函数结果做出的任何接受决定都是漏洞。
+    pub(crate) fn parse_unverified(bytes: &[u8]) -> Result<Self, AnnounceError> {
         if bytes.len() < 1 + 64 || bytes[0] != WIRE_VERSION {
             return Err(AnnounceError::BadFormat);
         }
-        let (sig_bytes, payload) = bytes[1..].split_at(64);
-        let signature = Signature::from_bytes(sig_bytes.try_into().expect("length checked"));
-        let ann: Self =
-            postcard::from_bytes(payload).map_err(|_| AnnounceError::BadFormat)?;
-        ann.node_id
-            .verify(payload, &signature)
-            .map_err(|_| AnnounceError::BadSignature)?;
-        Ok(ann)
+        let (_, payload) = bytes[1..].split_at(64);
+        postcard::from_bytes(payload).map_err(|_| AnnounceError::BadFormat)
     }
 
     /// `timestamp + ttl` 是否已过。
