@@ -59,6 +59,9 @@ pub enum VigilError {
     /// 内嵌 relay 关闭出错。
     #[error("relay shutdown failed")]
     RelayShutdown(#[from] iroh_relay::server::SupervisorError),
+    /// 等待 endpoint 在线超时。
+    #[error("endpoint did not come online within {after:?}")]
+    OnlineTimeout { after: Duration },
 }
 
 /// [`Builder`] 的缺省 DHT 状态:开(`dht` feature)。
@@ -83,6 +86,7 @@ pub struct Builder {
     pool_config: Option<RelayPoolConfig>,
     #[cfg(feature = "test-utils")]
     insecure_skip_cert_verify: bool,
+    online_timeout: Option<Duration>,
 }
 
 impl Builder {
@@ -162,6 +166,15 @@ impl Builder {
         self
     }
 
+    /// 等待 endpoint 在线(`online()`)的超时,默认 30s。
+    ///
+    /// 超时返回 [`VigilError::OnlineTimeout`]——冷启动锚点全不可达时
+    /// 快速失败,而不是无限挂起。
+    pub fn online_timeout(&mut self, timeout: Duration) -> &mut Self {
+        self.online_timeout = Some(timeout);
+        self
+    }
+
     /// 组装并启动。顺序固定:内嵌 relay → endpoint → gossip/router → pool topic → 后台任务。
     pub async fn spawn(&mut self) -> Result<VigilNode, VigilError> {
         let secret_key = self.secret_key.take().unwrap_or_else(SecretKey::generate);
@@ -234,9 +247,12 @@ impl Builder {
         }
         let endpoint = builder.bind().await?;
 
-        // 5. 有 relay 则等在线。
+        // 5. 有 relay 则等在线(限时:冷启动锚点全不可达时快速失败)。
         if has_relays {
-            endpoint.online().await;
+            let online_timeout = self.online_timeout.unwrap_or(Duration::from_secs(30));
+            if tokio::time::timeout(online_timeout, endpoint.online()).await.is_err() {
+                return Err(VigilError::OnlineTimeout { after: online_timeout });
+            }
         }
         // 内嵌 relay 节点在 home 确定为自己的 relay 后,补挂其余 relay。
         if own_relay_config.is_some() {
@@ -437,6 +453,27 @@ mod tests {
         #[cfg(feature = "dht")]
         b.discovery_dht(false);
         b
+    }
+
+    #[tokio::test]
+    async fn spawn_times_out_when_relay_unreachable() {
+        // 占用后释放本地端口,得到一个必然拒绝连接的 relay 地址。
+        let blocker = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let refused_port = blocker.local_addr().expect("addr").port();
+        drop(blocker);
+        let refused: iroh::RelayUrl = format!("https://127.0.0.1:{refused_port}")
+            .parse()
+            .expect("valid url");
+
+        let mut b = builder();
+        b.seed_relay(refused).online_timeout(Duration::from_millis(300));
+        let res = tokio::time::timeout(Duration::from_secs(5), b.spawn()).await;
+        match res {
+            Err(_) => panic!("spawn must not hang forever with online_timeout set"),
+            Ok(Err(VigilError::OnlineTimeout { .. })) => {}
+            Ok(Ok(_node)) => panic!("spawn unexpectedly succeeded against a refused relay"),
+            Ok(Err(e)) => panic!("expected OnlineTimeout, got {e:?}"),
+        }
     }
 
     #[tokio::test]
