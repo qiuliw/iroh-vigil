@@ -31,7 +31,7 @@ fn pool_topic() -> TopicId {
     TopicId::from_bytes(*blake3::hash(POOL_TOPIC_LABEL).as_bytes())
 }
 
-fn now_unix() -> u64 {
+pub(crate) fn system_now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("clock after epoch")
@@ -103,7 +103,12 @@ impl Builder {
         self
     }
 
-    /// 冷启动 seed relay(1 个即可)。
+    /// 冷启动 seed relay:作为本节点的传输/驻留锚点(home relay 候选)。
+    ///
+    /// 注意(iroh 0.98 语义):共享同一个 relay **不构成**成员发现路径——
+    /// 仅配 seed relay 的节点不会因此加入 pool topic 的 swarm。
+    /// swarm 形成需要至少一个 [`Builder::seed_node`](已知节点地址,可经其 relay
+    /// 传输层拨号),或可经 DHT 解析的节点 id。
     pub fn seed_relay(&mut self, url: RelayUrl) -> &mut Self {
         self.seed_relays.push(url);
         self
@@ -290,7 +295,7 @@ impl Builder {
                             neighbors.write().expect("neighbors lock").remove(&id);
                         }
                         Ok(GossipEvent::Received(msg)) => {
-                            let _ = pool.handle_wire(&msg.content, now_unix()).await;
+                            let _ = pool.handle_wire(&msg.content, system_now_unix()).await;
                         }
                         Ok(GossipEvent::Lagged) | Err(_) => {}
                     }
@@ -307,16 +312,18 @@ impl Builder {
             let sender = pool_sender.clone();
             let pool = pool.clone();
             tasks.spawn(async move {
-                let mut seq: u64 = 0;
+                // seq 以墙钟为底:重启(同 key)后 seq 仍单调递增,
+                // 否则会被对端按回放拒到旧 seq 追平为止。
+                let mut seq: u64 = system_now_unix();
                 let mut tick = interval(REBROADCAST_PERIOD);
                 tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 loop {
                     seq += 1;
                     let ann =
-                        RelayAnnouncement::new(sk.public(), url.clone(), quic_port, seq, now_unix());
+                        RelayAnnouncement::new(sk.public(), url.clone(), quic_port, seq, system_now_unix());
                     let wire = ann.sign(&sk);
                     // 先入自己的池:replay_set 才会包含自己,晚加入的邻居也能学到。
-                    let _ = pool.handle_wire(&wire, now_unix()).await;
+                    let _ = pool.handle_wire(&wire, system_now_unix()).await;
                     let _ = sender.broadcast(wire).await;
                     tick.tick().await;
                 }
@@ -332,7 +339,7 @@ impl Builder {
                 tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 loop {
                     tick.tick().await;
-                    pool.sweep(now_unix()).await;
+                    pool.sweep(system_now_unix()).await;
                 }
             });
         }

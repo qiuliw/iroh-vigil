@@ -4,7 +4,7 @@ use iroh_vigil::Builder;
 
 #[tokio::main]
 async fn main() -> Result<(), iroh_vigil::VigilError> {
-    let mut node = Builder::new().spawn().await?;
+    let node = Builder::new().spawn().await?;
     println!("iroh-vigil node: {}", node.node_id());
     tokio::signal::ctrl_c().await.expect("ctrl-c listener");
     node.shutdown().await

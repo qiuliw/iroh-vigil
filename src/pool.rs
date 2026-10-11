@@ -1,6 +1,6 @@
 //! Relay 公告池:收集 gossip 公告,验签防回放,动态挂载/卸载 endpoint 的 relay。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -128,6 +128,10 @@ impl RelayPool {
         // 决策段:只做同步判断,不跨 await 持锁;重复/拒绝路径在此提前返回。
         let evict = {
             let mut inner = self.inner.write().expect("pool lock");
+            // 入池即检查池自己的 TTL(过期/超前的未来时间戳都拒,防止挂载死 relay)。
+            if ann.is_expired_with_ttl(now_unix, inner.config.ttl) {
+                return Err(PoolError::Announce(AnnounceError::Expired));
+            }
             match inner.config.trust {
                 Trust::Everyone => {}
                 Trust::Only(ref ids) if ids.contains(&ann.node_id) => {}
@@ -229,6 +233,10 @@ impl RelayPool {
     }
 
     /// 清扫过期公告并卸载。
+    ///
+    /// 同时清掉已无存活条目的公告者的 `max_seq` 记录:
+    /// 否则重启后 seq 从 1 重新计数的公告者会被旧记录当回放拒掉,
+    /// 且 `Trust::Everyone` 下该表可被无界撑大。
     pub async fn sweep(&self, now_unix: u64) {
         let expired: Vec<RelayUrl> = {
             let inner = self.inner.read().expect("pool lock");
@@ -251,9 +259,17 @@ impl RelayPool {
             };
             endpoint.remove_relay(&url).await;
         }
+        {
+            let mut inner = self.inner.write().expect("pool lock");
+            let live: HashSet<EndpointId> =
+                inner.entries.values().map(|e| e.ann.node_id).collect();
+            inner.max_seq.retain(|id, _| live.contains(id));
+        }
     }
 
     /// 最近 `last_seen` 的 ≤32 条公告原始 wire(NeighborUp 重播用)。
+    ///
+    /// 过期条目可能仍在其中(清扫是周期性的);接收端的入池 TTL 检查是权威防线。
     pub fn replay_set(&self) -> Vec<Bytes> {
         let inner = self.inner.read().expect("pool lock");
         let mut entries: Vec<&PoolEntry> = inner.entries.values().collect();
@@ -357,6 +373,46 @@ mod tests {
         pool.sweep(NOW + 61).await;
         assert!(pool.known().is_empty(), "expired entry swept");
         assert!(matches!(events.try_recv(), Ok(RelayPoolEvent::Removed(_))));
+    }
+
+    #[tokio::test]
+    async fn expired_rejected_at_intake() {
+        let ep = endpoint().await;
+        let (pool, _events) = RelayPool::new(ep, RelayPoolConfig::default());
+        let sk = SecretKey::generate();
+
+        // 有效签名但早已过期(timestamp = NOW - 3600,默认 ttl 30 分钟)。
+        let url: RelayUrl = "https://127.0.0.1:3340".parse().expect("valid url");
+        let old = RelayAnnouncement::new(sk.public(), url, Some(3340), 1, NOW - 3600);
+        let res = pool.handle_wire(&old.sign(&sk), NOW).await;
+        assert!(
+            matches!(res, Err(PoolError::Announce(AnnounceError::Expired))),
+            "expired announcement must be rejected at intake"
+        );
+        assert!(pool.known().is_empty());
+    }
+
+    #[tokio::test]
+    async fn sweep_prunes_stale_announcer_seq() {
+        // 重启场景:公告者旧 seq 随条目过期被清掉,seq=1 的新一轮公告可被接受。
+        let ep = endpoint().await;
+        let (pool, _events) = RelayPool::new(
+            ep,
+            RelayPoolConfig { ttl: Duration::from_secs(60), ..Default::default() },
+        );
+        let sk = SecretKey::generate();
+
+        pool.handle_wire(&sample(&sk, 5), NOW).await.expect("seq 5 adds");
+        pool.sweep(NOW + 61).await;
+        assert!(pool.known().is_empty());
+
+        let url: RelayUrl = "https://127.0.0.1:3340".parse().expect("valid url");
+        let fresh = RelayAnnouncement::new(sk.public(), url, Some(3340), 1, NOW + 61);
+        let res = pool.handle_wire(&fresh.sign(&sk), NOW + 61).await;
+        assert!(
+            matches!(res, Ok(Some(_))),
+            "fresh announcement after sweep must be accepted despite lower seq"
+        );
     }
 
     #[tokio::test]

@@ -91,10 +91,18 @@ impl RelayAnnouncement {
     }
 
     /// 同 [`Self::is_expired`],显式指定 TTL。
+    ///
+    /// 时间戳落在 [`FUTURE_SLACK`] 之外的"未来"同样视为过期:
+    /// 否则 `timestamp > now` 会让 `saturating_sub` 恒为 0,新鲜度被永久绕过。
     pub fn is_expired_with_ttl(&self, now_unix: u64, ttl: Duration) -> bool {
-        now_unix.saturating_sub(self.timestamp) >= ttl.as_secs()
+        let age = now_unix.saturating_sub(self.timestamp);
+        let ahead = self.timestamp.saturating_sub(now_unix);
+        age >= ttl.as_secs() || ahead > FUTURE_SLACK.as_secs()
     }
 }
+
+/// 时钟偏移容忍上限。
+const FUTURE_SLACK: Duration = Duration::from_secs(5 * 60);
 
 #[cfg(test)]
 mod tests {
@@ -105,6 +113,10 @@ mod tests {
 
     fn announcer() -> SecretKey {
         SecretKey::generate()
+    }
+
+    fn sample_url() -> RelayUrl {
+        "https://127.0.0.1:3340".parse().expect("valid url")
     }
 
     fn sample(node_id: EndpointId) -> RelayAnnouncement {
@@ -170,6 +182,23 @@ mod tests {
         ));
         assert!(old.is_expired(one_hour_later));
         assert!(!old.is_expired(NOW));
+    }
+
+    #[test]
+    fn future_timestamp_rejected() {
+        let sk = announcer();
+        // 时钟偏移容忍之外的"未来"公告:新鲜度模型不可被未来时间戳绕过。
+        let from_future =
+            RelayAnnouncement::new(sk.public(), sample_url(), Some(3340), 1, NOW + 3600);
+        let wire = from_future.sign(&sk);
+        assert!(matches!(
+            RelayAnnouncement::decode(&wire, NOW),
+            Err(AnnounceError::Expired)
+        ));
+        // 容忍范围内的少量偏移不拒(正常时钟漂移)。
+        let skew = RelayAnnouncement::new(sk.public(), sample_url(), Some(3340), 1, NOW + 60);
+        let wire = skew.sign(&sk);
+        assert!(RelayAnnouncement::decode(&wire, NOW).is_ok());
     }
 
     #[test]

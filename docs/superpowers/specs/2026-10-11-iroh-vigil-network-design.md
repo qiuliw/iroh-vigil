@@ -94,6 +94,8 @@ struct RelayAnnouncement {
 
 `Builder::seed_relay(RelayUrl)`(1 个即可)与/或 `Builder::seed_node(NodeAddr)`。首节点可以是 `with_embedded_relay` 自举。DHT 发布使后续节点可通过 NodeId 直接解析地址,不依赖 seed 常驻。
 
+> **v1 实现注记(2026-10-11):** iroh 0.98 中共享 relay 不构成成员发现路径(无 relay 端点枚举,地址解析仅 DHT/DNS/mdns/内存表)。因此"仅 1 个 seed relay 即入群"在 v1 未达成:swarm 形成需要 ≥1 个 `seed_node`(其 EndpointAddr 可经对方 home relay 拨号),seed relay 的角色是传输/驻留锚点与 home 候选。gossip 化的 `AddressLookup`(让 seed relay 重新有意义)留给 v2。
+
 ## 测试计划(参考 iroh 官方测试模式: 进程内 relay + 多 endpoint)
 
 feature `test-utils` 启用 `iroh::test_utils::run_relay_server()` 与 `CaRootsConfig::insecure_skip_verify`。
