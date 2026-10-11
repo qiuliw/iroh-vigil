@@ -280,6 +280,10 @@ impl Builder {
         if let Some(trust) = self.trust.clone() {
             pool_config.trust = trust;
         }
+        // 明文 Http 内嵌 relay 是本机开发模式:自己的 http:// 公告要能入自己的池。
+        if let Some(RelayBind::Http { .. }) = self.embedded_relay {
+            pool_config.allow_insecure_urls = true;
+        }
         let ttl = pool_config.ttl;
         let (pool, relay_events) = RelayPool::new(endpoint.clone(), pool_config);
 

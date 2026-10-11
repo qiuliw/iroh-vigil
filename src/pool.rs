@@ -38,6 +38,8 @@ pub struct RelayPoolConfig {
     pub max_entries: usize,
     /// 信任策略。
     pub trust: Trust,
+    /// 允许 `http://`(明文)relay URL 入池。默认拒绝,仅本机开发放开。
+    pub allow_insecure_urls: bool,
 }
 
 impl Default for RelayPoolConfig {
@@ -46,6 +48,7 @@ impl Default for RelayPoolConfig {
             ttl: DEFAULT_TTL,
             max_entries: 64,
             trust: Trust::default(),
+            allow_insecure_urls: false,
         }
     }
 }
@@ -65,6 +68,9 @@ pub enum PoolError {
     /// 池容量为 0,无法容纳任何公告。
     #[error("pool at zero capacity")]
     CapacityEvicted,
+    /// 公告的 relay URL 不是 https(且未显式放开)。
+    #[error("insecure relay url rejected")]
+    InsecureUrl,
 }
 
 struct PoolEntry {
@@ -146,6 +152,9 @@ impl RelayPool {
             // 入池即检查池自己的 TTL(过期/超前的未来时间戳都拒,防止挂载死 relay)。
             if ann.is_expired_with_ttl(now_unix, inner.config.ttl) {
                 return Err(PoolError::Announce(AnnounceError::Expired));
+            }
+            if !inner.config.allow_insecure_urls && ann.relay_url.scheme() != "https" {
+                return Err(PoolError::InsecureUrl);
             }
             if let Some(&seq) = inner.max_seq.get(&ann.node_id) {
                 if ann.seq < seq {
@@ -503,6 +512,31 @@ mod tests {
             known.iter().any(|a| a.relay_url == url2 && a.seq == 2),
             "refreshed entry must survive a concurrent sweep, got {known:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn rejects_plaintext_relay_urls() {
+        let ep = endpoint().await;
+        let sk = SecretKey::generate();
+        let http_url: RelayUrl = "http://127.0.0.1:3340".parse().expect("valid url");
+        let wire = RelayAnnouncement::new(sk.public(), http_url, None, 1, NOW).sign(&sk);
+
+        let (pool, _events) = RelayPool::new(ep, RelayPoolConfig::default());
+        let res = pool.handle_wire(&wire, NOW).await;
+        assert!(
+            matches!(res, Err(PoolError::InsecureUrl)),
+            "plaintext url must be rejected by default, got {res:?}"
+        );
+        assert!(pool.known().is_empty());
+
+        // 显式放行(本机开发模式)。
+        let ep2 = endpoint().await;
+        let (pool2, _events2) = RelayPool::new(
+            ep2,
+            RelayPoolConfig { allow_insecure_urls: true, ..Default::default() },
+        );
+        let res = pool2.handle_wire(&wire, NOW).await;
+        assert!(matches!(res, Ok(Some(_))), "opt-in must accept, got {res:?}");
     }
 
     #[tokio::test]
