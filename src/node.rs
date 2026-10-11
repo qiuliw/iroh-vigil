@@ -170,18 +170,35 @@ impl Builder {
             None => None,
         };
 
-        // 2. RelayMap = seed relays + 自己内嵌 relay。
-        let mut relay_configs: Vec<RelayConfig> = Vec::new();
-        for url in &self.seed_relays {
-            relay_configs.push(RelayConfig::new(url.clone(), None));
-        }
-        if let Some(relay) = &embedded {
-            relay_configs.push(RelayConfig::new(
+        // 2. RelayMap 组装。
+        //
+        // iroh 只对 home relay 维持常连,其余 relay 按需连接。因此内嵌 relay 的节点
+        // 初始 map 只挂自己的 relay——保证 home = own,公告的 URL 才可达;
+        // seed relays 在 online 后再动态补挂(仅出站按需使用,home 粘住 own)。
+        // seed 节点地址中的 Relay 传输层也进 map(如 D 仅凭 A 的 relay 入网的场景),
+        // 否则该节点 relay 被禁用,无法经 relay 传输层拨号。
+        let own_relay_config = embedded.as_ref().map(|relay| {
+            RelayConfig::new(
                 relay.relay_url().clone(),
                 relay.quic_port().map(iroh_relay::RelayQuicConfig::new),
-            ));
+            )
+        });
+        let mut extra_relays: Vec<RelayConfig> = Vec::new();
+        for url in &self.seed_relays {
+            extra_relays.push(RelayConfig::new(url.clone(), None));
         }
-        let has_relays = !relay_configs.is_empty();
+        for addr in &self.seed_nodes {
+            for transport in &addr.addrs {
+                if let iroh::TransportAddr::Relay(url) = transport {
+                    extra_relays.push(RelayConfig::new(url.clone(), None));
+                }
+            }
+        }
+        let initial_map: Vec<RelayConfig> = match &own_relay_config {
+            Some(own) => vec![own.clone()],
+            None => extra_relays.clone(),
+        };
+        let has_relays = !initial_map.is_empty();
 
         // 3. seed 节点地址进 MemoryLookup。
         let memory_lookup = MemoryLookup::new();
@@ -192,7 +209,7 @@ impl Builder {
         // 4. endpoint。
         let mut builder = Endpoint::builder(Minimal).secret_key(secret_key.clone());
         builder = if has_relays {
-            builder.relay_mode(RelayMode::Custom(RelayMap::from_iter(relay_configs)))
+            builder.relay_mode(RelayMode::Custom(RelayMap::from_iter(initial_map)))
         } else {
             builder.relay_mode(RelayMode::Disabled)
         };
@@ -218,6 +235,14 @@ impl Builder {
         // 5. 有 relay 则等在线。
         if has_relays {
             endpoint.online().await;
+        }
+        // 内嵌 relay 节点在 home 确定为自己的 relay 后,补挂其余 relay。
+        if own_relay_config.is_some() {
+            for config in &extra_relays {
+                endpoint
+                    .insert_relay(config.url.clone(), std::sync::Arc::new(config.clone()))
+                    .await;
+            }
         }
 
         // 6. gossip + router。
@@ -250,35 +275,15 @@ impl Builder {
             let neighbors = neighbors.clone();
             let sender = pool_sender.clone();
             let mut receiver = pool_receiver;
-            let mut announced = embedded.is_none(); // 无内嵌 relay 则无需自广播
-            let announce_state = embedded.as_ref().map(|relay| {
-                (
-                    relay.relay_url().clone(),
-                    relay.quic_port(),
-                    secret_key.clone(),
-                )
-            });
             tasks.spawn(async move {
                 while let Some(ev) = receiver.next().await {
                     match ev {
-                        Ok(GossipEvent::NeighborUp(id)) => {
-                            neighbors.write().expect("neighbors lock").insert(id);
+                        Ok(GossipEvent::NeighborUp(_id)) => {
+                            neighbors.write().expect("neighbors lock").insert(_id);
+                            // 向新邻居重播已知公告(含自己的——已入自己的池)。
                             let replay = pool.replay_set();
                             for wire in replay.into_iter().take(REPLAY_LIMIT) {
                                 let _ = sender.broadcast(wire).await;
-                            }
-                            if !announced {
-                                if let Some((url, quic_port, sk)) = &announce_state {
-                                    let ann = RelayAnnouncement::new(
-                                        sk.public(),
-                                        url.clone(),
-                                        *quic_port,
-                                        1,
-                                        now_unix(),
-                                    );
-                                    let _ = sender.broadcast(ann.sign(sk)).await;
-                                    announced = true;
-                                }
                             }
                         }
                         Ok(GossipEvent::NeighborDown(id)) => {
@@ -293,22 +298,27 @@ impl Builder {
             });
         }
 
-        // (b) 自己的公告每 10 分钟重发(seq 单调递增)。
+        // (b) 自己的公告:立即入自己的池并广播(gossip 在入群前排队),
+        // 之后每 10 分钟 seq+1 重发。
         if let Some(relay) = &embedded {
             let url = relay.relay_url().clone();
             let quic_port = relay.quic_port();
             let sk = secret_key.clone();
             let sender = pool_sender.clone();
+            let pool = pool.clone();
             tasks.spawn(async move {
-                let mut seq: u64 = 1;
+                let mut seq: u64 = 0;
                 let mut tick = interval(REBROADCAST_PERIOD);
                 tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 loop {
-                    tick.tick().await;
                     seq += 1;
                     let ann =
                         RelayAnnouncement::new(sk.public(), url.clone(), quic_port, seq, now_unix());
-                    let _ = sender.broadcast(ann.sign(&sk)).await;
+                    let wire = ann.sign(&sk);
+                    // 先入自己的池:replay_set 才会包含自己,晚加入的邻居也能学到。
+                    let _ = pool.handle_wire(&wire, now_unix()).await;
+                    let _ = sender.broadcast(wire).await;
+                    tick.tick().await;
                 }
             });
         }
