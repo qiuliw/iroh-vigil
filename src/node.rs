@@ -24,9 +24,6 @@ pub const POOL_TOPIC_LABEL: &[u8] = b"iroh-vigil/relay-pool/v1";
 
 /// 自广播周期(spec 值)。
 const REBROADCAST_PERIOD: Duration = Duration::from_secs(10 * 60);
-/// NeighborUp 重播上限(spec 值)。
-const REPLAY_LIMIT: usize = 32;
-
 fn pool_topic() -> TopicId {
     TopicId::from_bytes(*blake3::hash(POOL_TOPIC_LABEL).as_bytes())
 }
@@ -286,9 +283,11 @@ impl Builder {
                         Ok(GossipEvent::NeighborUp(_id)) => {
                             neighbors.write().expect("neighbors lock").insert(_id);
                             // 向新邻居重播已知公告(含自己的——已入自己的池)。
+                            // 只发直连邻居(plumtree 会自行中继),避免每次入群全网放大;
+                            // replay_set 已限 32 条。
                             let replay = pool.replay_set();
-                            for wire in replay.into_iter().take(REPLAY_LIMIT) {
-                                let _ = sender.broadcast(wire).await;
+                            for wire in replay {
+                                let _ = sender.broadcast_neighbors(wire).await;
                             }
                         }
                         Ok(GossipEvent::NeighborDown(id)) => {
