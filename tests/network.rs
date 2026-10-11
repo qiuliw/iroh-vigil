@@ -71,10 +71,10 @@ async fn recv_broadcast(
 ) -> bool {
     let deadline = tokio::time::timeout(WINDOW, async {
         while let Some(ev) = receiver.next().await {
-            if let Ok(GossipEvent::Received(msg)) = ev {
-                if msg.content.as_ref() == content {
-                    return true;
-                }
+            if let Ok(GossipEvent::Received(msg)) = ev
+                && msg.content.as_ref() == content
+            {
+                return true;
             }
         }
         false
@@ -277,10 +277,10 @@ async fn gossip_app_topic_broadcast() {
         let mut want: Vec<String> = (0..4).filter(|j| *j != i).map(|j| format!("msg-{j}")).collect();
         let got_all = tokio::time::timeout(WINDOW, async {
             while !want.is_empty() {
-                if let Some(Ok(GossipEvent::Received(msg))) = recv.next().await {
-                    if let Ok(s) = std::str::from_utf8(&msg.content) {
-                        want.retain(|w| w != s);
-                    }
+                if let Some(Ok(GossipEvent::Received(msg))) = recv.next().await
+                    && let Ok(s) = std::str::from_utf8(&msg.content)
+                {
+                    want.retain(|w| w != s);
                 }
             }
         })
@@ -289,7 +289,7 @@ async fn gossip_app_topic_broadcast() {
         assert!(got_all, "node {i} must receive the other three messages");
     }
 
-    for mut node in nodes {
+    for node in nodes {
         node.shutdown().await.expect("node shutdown");
     }
     seed_server.shutdown().await.expect("seed shutdown");

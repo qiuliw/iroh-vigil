@@ -138,11 +138,11 @@ impl RelayPool {
                     return Err(PoolError::Stale);
                 }
                 if ann.seq == seq {
-                    if let Some(entry) = inner.entries.get_mut(&ann.relay_url) {
-                        if entry.ann.seq == ann.seq {
-                            entry.last_seen = now_unix;
-                            return Ok(None);
-                        }
+                    if let Some(entry) = inner.entries.get_mut(&ann.relay_url)
+                        && entry.ann.seq == ann.seq
+                    {
+                        entry.last_seen = now_unix;
+                        return Ok(None);
                     }
                     return Err(PoolError::Stale);
                 }
@@ -150,7 +150,7 @@ impl RelayPool {
             if inner.config.max_entries == 0 {
                 return Err(PoolError::CapacityEvicted);
             }
-            let evict = if !inner.entries.contains_key(&ann.relay_url)
+            if !inner.entries.contains_key(&ann.relay_url)
                 && inner.entries.len() >= inner.config.max_entries
             {
                 Some(
@@ -163,8 +163,7 @@ impl RelayPool {
                 )
             } else {
                 None
-            };
-            evict
+            }
         };
 
 

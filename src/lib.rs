@@ -4,7 +4,7 @@
 //! 配合全局 DHT 发现,减少对固定公网 relay 的依赖。
 //!
 //! ```no_run
-//! # async fn demo() -> anyhow::Result<()> {
+//! # async fn demo() -> Result<(), iroh_vigil::VigilError> {
 //! let mut node = iroh_vigil::Builder::new().spawn().await?;
 //! # Ok(())
 //! # }

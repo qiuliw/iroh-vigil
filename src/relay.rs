@@ -55,7 +55,7 @@ impl EmbeddedRelay {
                     rustls::crypto::ring::default_provider(),
                 ))
                 .with_safe_default_protocol_versions()
-                .map_err(rustls::Error::from)?
+                ?
                 .with_no_client_auth()
                 .with_single_cert(certs.clone(), key)?;
                 let quic_opt = quic.then(|| QuicConfig {

@@ -472,11 +472,11 @@ mod tests {
         let mut got = false;
         let deadline = tokio::time::timeout(Duration::from_secs(10), async {
             while let Some(ev) = recv_b.next().await {
-                if let iroh_gossip::api::Event::Received(msg) = ev.expect("stream ok") {
-                    if msg.content.as_ref() == b"ping" {
-                        got = true;
-                        break;
-                    }
+                if let iroh_gossip::api::Event::Received(msg) = ev.expect("stream ok")
+                    && msg.content.as_ref() == b"ping"
+                {
+                    got = true;
+                    break;
                 }
             }
         })
