@@ -4,7 +4,21 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+iroh = "0.98.2"
+iroh-gossip = "0.98.0"
+iroh-relay = { version = "0.98.0", features = ["server"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+postcard = "1"
+blake3 = "1"
+thiserror = "2"
+futures = "0.3"
+
+[dev-dependencies]
 iroh = { version = "0.98.2", features = ["test-utils"] }
-iroh-gossip = { version = "0.98.0", features = ["test-utils"] }
-iroh-relay = "0.98.0"
-tokio = { version = "1.53.2", features = ["full"] }
+
+[features]
+default = ["dht"]
+dht = ["iroh/address-lookup-pkarr-dht"]
+mdns = ["iroh/address-lookup-mdns"]
+test-utils = ["iroh/test-utils", "iroh-gossip/test-utils", "iroh-relay/test-utils"]
