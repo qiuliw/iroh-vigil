@@ -2,7 +2,7 @@
 
 > 把 relay 下沉进 gossip 网络:有公网能力的节点兼任 relay 并在群内广播,其余节点动态挂载,减少对固定公网 relay 的依赖。
 
-Rust 库,基于 `iroh` 0.98 / `iroh-gossip` / `iroh-relay`。
+Rust 库,基于 `iroh` 0.98 / `iroh-gossip` / `iroh-relay`。完整设计见 [docs/design.md](docs/design.md)。
 
 ## 为什么
 
@@ -14,18 +14,18 @@ Rust 库,基于 `iroh` 0.98 / `iroh-gossip` / `iroh-relay`。
 
 ![设计动机草图:从依赖公网 relay 到 relay 下沉进 gossip 网](docs/assets/design-sketch.png)
 
-诚实的前提(spec 称之为**硬约束**):NAT 后的普通节点无法被陌生节点入站连接,所以不能人人互为 relay;冷启动第一次入群仍需至少一个可达锚点(seed relay / seed 节点 / 公共 DHT)。本设计的目标是把这些锚点做小、做散、可替换,而不是消灭它们。
+诚实的前提:NAT 后的普通节点无法被陌生节点入站连接,所以不能人人互为 relay;冷启动第一次入群仍需至少一个可达锚点(seed relay / seed 节点 / 公共 DHT)。iroh-vigil 把这些锚点做小、做散、可替换,而不是消灭它们。
 
 ## 工作原理
 
 | 模块 | 职责 |
 |---|---|
-| `announce` | `RelayAnnouncement`:`node_id + relay_url + quic_port + seq + timestamp`,ed25519 签名,默认 30 分钟 TTL,`[0x01][64B 签名][postcard 载荷]` 线上格式 |
+| `announce` | `RelayAnnouncement`:`node_id + relay_url + quic_port + seq + timestamp`,ed25519 签名,默认 30 分钟 TTL,线上格式 `[0x01][64B 签名][postcard 载荷]` |
 | `relay` | `EmbeddedRelay`:包装 `iroh-relay` 服务器,`RelayBind::Tls`(生产)/ `Http`(本机开发)/ `SelfSignedTest`(测试) |
-| `pool` | `RelayPool`:收到公告后验签 → 信任检查 → seq 回放检查 → 容量淘汰(最旧 `last_seen`)→ `endpoint.insert_relay`;过期清扫时 `remove_relay`;事件走 mpsc 通知调用方 |
-| `node` | `VigilNode` + `Builder`:组装 endpoint + 内嵌 relay + gossip Router + RelayPool,跑三个后台任务(公告事件循环 / 自有公告每 10 分钟重发 / 每 `ttl/2` 清扫) |
+| `pool` | `RelayPool`:信任过滤 → 验签 → 新鲜度(TTL/未来时间戳)→ seq 回放 → 容量淘汰 → `insert_relay`/`remove_relay`;事件流通知调用方 |
+| `node` | `VigilNode` + `Builder`:组装 endpoint + 内嵌 relay + gossip Router + RelayPool 与三个后台任务 |
 
-公告在专用 gossip topic `iroh-vigil/relay-pool/v1` 内传播;对新上来的邻居重播已知公告(上限 32 条,防放大)。
+公告在专用 gossip topic(`iroh-vigil/relay-pool/v1` 的 blake3 哈希)内传播;对新邻居只向直连邻居重播已知公告(≤32 条,防放大);内嵌 relay 节点每 10 分钟以递增 seq 重发自己的公告;池每 `ttl/2` 清扫过期条目。
 
 ## 快速开始
 
@@ -82,6 +82,8 @@ while let Some(event) = events.recv().await {
 }
 ```
 
+其他常用配置:`trust(Trust::Only(vec![...]))` 限制公告者、`pool_config(...)` 调 TTL/容量、`online_timeout(...)` 限定冷启动等待(默认 30s,锚点不可达时快速失败)。
+
 ## 特性开关
 
 | feature | 默认 | 说明 |
@@ -92,18 +94,16 @@ while let Some(event) = events.recv().await {
 
 ## 测试
 
-不 mock 协议:单进程内起真实的 iroh-relay 服务器与多个 endpoint,全部走 loopback,自签证书 + `insecure_skip_verify`。16 个单元测试 + 3 个端到端场景(gossip 学到内嵌 relay / seed relay 死亡后网络自愈、无 seed 的新节点凭已知地址入群 / 4 节点 app topic 全员互通);DHT 用例需要真实外网,标记 `#[ignore]`。
+不 mock 协议:单进程内起真实的 iroh-relay 服务器与多个 endpoint,全部走 loopback,自签证书 + `insecure_skip_verify`。20 个单元测试 + 3 个端到端场景(gossip 学到内嵌 relay / seed relay 死亡后网络自愈、无 seed 的新节点凭已知地址入群 / 4 节点 app topic 全员互通);DHT 用例需要真实外网,标记 `#[ignore]`。
 
 ```sh
 cargo test --features test-utils
 ```
 
-## 状态与限制
+## 限制与路线
 
-v0.1.0,`feature/network-layer` 分支。设计文档见 `docs/superpowers/specs/2026-10-11-iroh-vigil-network-design.md`。
-
-当前已知的诚实限制:
+当前 v0.1.1。诚实列出的限制:
 
 - **信任模型是 v1 的**:`Trust::Everyone` 默认接受任何有效签名公告(有 Sybil 风险),生产建议 `trust(Trust::Only(vec![...]))`。
-- **seed relay 本身不构成发现路径**(iroh 0.98 语义):swarm 形成需要至少一个 `seed_node`,或可经 DHT 解析的节点 id;seed relay 的角色是传输/驻留锚点。gossip 化的 `AddressLookup` 留给 v2。
-- relay 信誉/延迟评分、基于 gossip 的节点地址 lookup,均为 v2 非目标。
+- **seed relay 本身不构成发现路径**(iroh 0.98 语义):swarm 形成需要至少一个 `seed_node`,或可经 DHT 解析的节点 id;seed relay 的角色是传输/驻留锚点。
+- relay 信誉/延迟评分、基于 gossip 的节点地址 lookup,规划在 v2。
