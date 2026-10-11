@@ -129,9 +129,14 @@ mod tests {
     fn tampered_payload_rejected() {
         let sk = announcer();
         let mut wire = sample(sk.public()).sign(&sk).to_vec();
-        // 翻转 node_id 区内的字节:postcard 仍可解码,签名校验必然失败。
-        let in_node_id = 1 + 64 + 5;
-        wire[in_node_id] ^= 0xff;
+        // 在 relay_url 字符串体内把端口数字 '3' 改成 '2':长度不变、UTF-8 仍合法,
+        // postcard 必然解码成功,签名校验必然失败。
+        // (node_id 是 postcard varint 流,字节翻转会随机落进 BadFormat/BadSignature,不可用。)
+        let at = wire
+            .windows(4)
+            .position(|w| w == b"3340")
+            .expect("port digits present in url");
+        wire[at] ^= 0x01;
         assert!(matches!(
             RelayAnnouncement::decode(&wire, NOW),
             Err(AnnounceError::BadSignature)
