@@ -295,14 +295,28 @@ async fn gossip_app_topic_broadcast() {
     seed_server.shutdown().await.expect("seed shutdown");
 }
 
-/// spec 测试 6:纯 DHT 发布/解析(需真实外网)。
+/// spec 测试 6:DHT 发布/解析(需真实外网)。
+///
+/// 两节点共享一个 seed relay:`DhtAddressLookup` 默认 `AddrFilter::relay_only`,
+/// RelayMode::Disabled 的节点没有可发布的传输地址,裸 id 永远解析不出对端。
+/// 共享 relay 不构成发现路径,`connect(A.node_id())` 的地址解析只能来自 DHT。
 #[cfg(feature = "dht")]
 #[ignore = "needs real internet"]
 #[tokio::test]
 async fn dht_publish_resolve() {
-    let a = Builder::new().spawn().await.expect("a spawns (dht on)");
-    tokio::time::sleep(Duration::from_secs(2)).await; // 等 DHT publish
-    let b = Builder::new().spawn().await.expect("b spawns (dht on)");
+    let (_seed_map, seed_url, seed_server) = run_relay_server().await.expect("seed relay");
+
+    let a = builder()
+        .seed_relay(seed_url.clone())
+        .spawn()
+        .await
+        .expect("a spawns (dht on)");
+    tokio::time::sleep(Duration::from_secs(5)).await; // 等 DHT publish
+    let b = builder()
+        .seed_relay(seed_url.clone())
+        .spawn()
+        .await
+        .expect("b spawns (dht on)");
 
     let conn = tokio::time::timeout(WINDOW, async {
         b.endpoint()
@@ -316,4 +330,5 @@ async fn dht_publish_resolve() {
 
     a.shutdown().await.expect("a shutdown");
     b.shutdown().await.expect("b shutdown");
+    seed_server.shutdown().await.expect("seed shutdown");
 }
