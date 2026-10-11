@@ -4,3 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+iroh = { version = "0.98.2", features = ["test-utils"] }
+iroh-gossip = { version = "0.98.0", features = ["test-utils"] }
+iroh-relay = "0.98.0"
+tokio = { version = "1.53.2", features = ["full"] }
