@@ -13,7 +13,7 @@ use iroh_gossip::api::{Event as GossipEvent, GossipSender};
 use iroh_gossip::{Gossip, TopicId};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
-use tokio::time::interval;
+use tokio::time::{interval_at, interval};
 
 use crate::announce::RelayAnnouncement;
 use crate::pool::{RelayPool, RelayPoolConfig, RelayPoolEvent};
@@ -314,7 +314,9 @@ impl Builder {
                 // seq 以墙钟为底:重启(同 key)后 seq 仍单调递增,
                 // 否则会被对端按回放拒到旧 seq 追平为止。
                 let mut seq: u64 = system_now_unix();
-                let mut tick = interval(REBROADCAST_PERIOD);
+                // interval 的首个 tick 立即完成,用 interval_at 从一个周期后起拍,
+                // 否则 seq=1、seq=2 会背靠背广播两次。
+                let mut tick = interval_at(tokio::time::Instant::now() + REBROADCAST_PERIOD, REBROADCAST_PERIOD);
                 tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 loop {
                     seq += 1;
